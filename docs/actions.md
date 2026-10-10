@@ -3,9 +3,25 @@
 This doc gathers all the _actions_ that the EV3 firmware exposes to an Argo agent.
 The file is divided in sections, each section for one specific component.
 
-### Driving Base - Large Motors
+### Large Motors
 
-These are the motors commonly used to make a driving robot to walk.
+These are the motors commonly used to make the robot walk in case of a driving robot.
+
+| Command       | Argo usage                 | Description                                                                                                                                                   | Optional parameters & defaults                               |
+| ------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `forward(V)`  | `.argo.act(forward(700))`  | Both motors forward at speed V.                                                                                                                               | `V` optional → **400**. `forward` alone is valid.            |
+| `backward(V)` | `.argo.act(backward(700))` | Both motors backward at speed V.                                                                                                                              | `V` optional → **400**.                                      |
+| `left(V)`     | `.argo.act(left(300))`     | Spins counter-clockwise at speed V.                                                                                                                           | `V` optional → **400**.                                      |
+| `right(V)`    | `.argo.act(right(300))`    | Spins clockwise at speed V.                                                                                                                                   | `V` optional → **400**.                                      |
+| `move(E,D)`   | `.argo.act(move(400,200))` | Independent speed per motor. The only way to drive a **smooth arc** — the discrete vocabulary can only go straight or spin in place.                          | Both **required**. No defaults; wrong arity returns `false`. |
+| `reset`       | `.argo.act(reset)`         | Zeroes both drive encoders. Next cycle reports `pos(0,0)`.                                                                                                    | None.                                                        |
+| `brake`       | `.argo.act(brake)`         | Makes every subsequent `stop` brake. **This is the startup default.**                                                                                         | None. Affects all later `stop` calls, not just the next one. |
+| `coast`       | `.argo.act(coast)`         | Makes every subsequent `stop` release the wheels, so the robot rolls on. This is the ev3dev factory default, unsuitable for an agent that stops at obstacles. | None. Affects all later `stop` calls.                        |
+| `hold`        | `.argo.act(hold)`          | Makes every subsequent `stop` actively hold position against a push.                                                                                          | None. Affects all later `stop` calls.                        |
+
+### Medium Motor
+
+The medium motor has a more fine grained motion, it is used to perform more delicate actions.
 
 | Command       | Argo usage                   | Description                                                                                                               | Optional parameters & defaults                        |
 | ------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
