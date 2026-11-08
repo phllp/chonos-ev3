@@ -1,0 +1,322 @@
+#! /bin/sh
+# ---------------------------------------------------------------------------
+# chonosEmbeddedMAS - implementacao para ev3dev / LEGO Mindstorms EV3
+#
+# Reimplementa o contrato que a ChonIDE espera,
+#
+# Uso (identico ao original):
+#   chonosEmbeddedMAS --start [-f arquivo.mas2j] [-m heapMB]
+#   chonosEmbeddedMAS --stop  [-f arquivo.mas2j]
+#   chonosEmbeddedMAS --import -f pacote.zip
+# ---------------------------------------------------------------------------
+
+EmbedMAS_TMP=/tmp/.embedMAS
+mkdir -p "$EmbedMAS_TMP"
+
+# --------------------------------------------------------------------------
+# Configuração. 
+# Pode ser sobreesrito em /etc/chonos-ev3.conf
+# --------------------------------------------------------------------------
+MAS_HOME="$HOME/EmbeddedMAS"
+LIB_DIR="$HOME/chonos/lib"
+JAVA_BIN=/usr/lib/jvm/jri-11-ev3/bin/java
+MAIN_CLASS=group.chon.ev3.Main # Lançador próprio
+LOGGING_CONF="$HOME/chonos/logging.properties"
+GRACE=20            # segundos ate o "kill -9"
+HEAP_MB=16          # MB de heap para a JVM
+CONTROL_PORT=3276   # canal de controle do lancador (loopback)
+CONTROL_TIMEOUT=90  # recarga pode demorar; o agente leva ~1 s cada
+BOOT_TIMEOUT=120    # espera maxima pelo MAS ficar pronto
+
+[ -f /etc/chonos-ev3.conf ] && . /etc/chonos-ev3.conf
+
+# --------------------------------------------------------------------------
+while getopts f:m:i:-: flag
+do
+    case "${flag}" in
+        f) file=${OPTARG};;
+        m) memory=${OPTARG};;
+        i) interpreter=${OPTARG};;
+        -) opt=${OPTARG};;
+    esac
+done
+
+# Mantido por compatibilidade de linha de comando. Neste dispositivo há um
+# único interpretador viavel, entao a flag é aceita e ignorada.
+[ -n "$interpreter" ] && [ "$interpreter" != "jasonEmbedded" ] && \
+    echo "Aviso: -i $interpreter ignorado; usando classpath local" >&2
+
+# --------------------------------------------------------------------------
+# Medida de segurança: Para todos os motores escrevendo direto no sysfs.
+# O estado dos atuadores vive no kernel, não na JVM. Se o MAS morrer sem passar
+# pelo --stop, os motores podem ficar rodando indeterminadamente.
+# --------------------------------------------------------------------------
+parar_motores() {
+    for m in /sys/class/tacho-motor/motor*; do
+        [ -w "$m/command" ] || continue
+        echo stop > "$m/command" 2>/dev/null
+    done
+}
+
+log() {
+    if [ -x /usr/bin/chonos-log ]; then
+        /usr/bin/chonos-log -e "$1"
+    else
+        echo "$1" >&2
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Envia um comando ao canal de controle do lancador e imprime a resposta.
+#
+# Tenta nc, depois python3. Evita subir uma JVM pois há um custo de tempo considerável,
+# E o python3 esta sempre presente no ev3dev.
+# --------------------------------------------------------------------------
+controle() {
+    cmd="$1"
+    if command -v nc >/dev/null 2>&1; then
+        printf '%s\n' "$cmd" | nc -w "$CONTROL_TIMEOUT" 127.0.0.1 "$CONTROL_PORT" 2>/dev/null
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$cmd" "$CONTROL_PORT" "$CONTROL_TIMEOUT" <<'PYEOF' 2>/dev/null
+import socket, sys
+cmd, porta, tmo = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+try:
+    s = socket.create_connection(("127.0.0.1", porta), timeout=tmo)
+    s.settimeout(tmo)
+    s.sendall((cmd + "\n").encode())
+    print(s.makefile().readline().strip())
+    s.close()
+except Exception:
+    print("sem runtime")
+PYEOF
+    else
+        echo "sem cliente (instale nc ou python3)"
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Política de memória
+#
+# A reserva do SO é proporcional, com piso absoluto, e o heap nunca excede o que sobra.
+# --------------------------------------------------------------------------
+memoryUSAGE() {
+    TOTAL_MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+
+    if [ "$TOTAL_MEM" -lt 128 ]; then
+        MEMORY=$(( TOTAL_MEM * 20 / 100 ))
+        RESERVA=32
+    elif [ "$TOTAL_MEM" -lt 1025 ]; then
+        MEMORY=$(( TOTAL_MEM - 256 ))
+        RESERVA=64
+    else
+        MEMORY=$(( TOTAL_MEM - 512 ))
+        RESERVA=128
+    fi
+
+    [ "$MEMORY" -lt 8 ] && MEMORY=8
+
+    MAX_FOR_MAS=$(( TOTAL_MEM - RESERVA ))
+    [ "$MAX_FOR_MAS" -lt 8 ] && MAX_FOR_MAS=8
+    [ "$MEMORY" -gt "$MAX_FOR_MAS" ] && MEMORY=$MAX_FOR_MAS
+
+    echo "$MEMORY" > "$EmbedMAS_TMP/memory2MAS"
+    HEAP_MB=$MEMORY
+}
+
+# --------------------------------------------------------------------------
+# Monta o classpath a partir de LIB_DIR
+# --------------------------------------------------------------------------
+build_classpath() {
+    if [ ! -d "$LIB_DIR" ]; then
+        echo "{ \"message\" : \"ERRO: $LIB_DIR nao existe\"}"
+        exit 1
+    fi
+    CP=""
+    for j in "$LIB_DIR"/*.jar; do
+        [ -f "$j" ] || continue
+        if [ -z "$CP" ]; then CP="$j"; else CP="$CP:$j"; fi
+    done
+    if [ -z "$CP" ]; then
+        echo "{ \"message\" : \"ERRO: nenhum jar em $LIB_DIR\"}"
+        exit 1
+    fi
+}
+
+# --------------------------------------------------------------------------
+# --start
+# --------------------------------------------------------------------------
+if [ "$opt" = "start" ]; then
+    pid=$(cat "$EmbedMAS_TMP/embeddedMAS.pid" 2>/dev/null)
+
+    # Valida o PID: se o processo morreu sem passar pelo --stop, o arquivo
+    # fica orfão e travaria todo start seguinte.
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        log "[ChonOS EmbeddedMAS] PID $pid orfao, descartando"
+        rm -f "$EmbedMAS_TMP/embeddedMAS.pid"
+        pid=""
+    fi
+
+    [ -z "$file" ] && file=$(ls "$MAS_HOME"/*.mas2j 2>/dev/null | head -1)
+
+    if [ -z "$file" ] || [ ! -f "$file" ]; then
+        echo "{ \"message\" : \"ERRO: nenhum .mas2j encontrado em $MAS_HOME\"}"
+        exit 1
+    fi
+
+    if [ -n "$pid" ]; then
+        # MAS ja rodando. Em vez de matar e recriar a JVM, sinaliza o 
+        # canal de controle do lançador para recarregar os agentes a partir 
+        # dos .asl no disco.
+        # Criar um agente numa JVM ja quente custa menos de um segundo, iniciar
+        # do zero leva mais de um minuto no EV3
+        #
+        espera=0
+        estado=$(controle ping)
+        while [ "$estado" = "ok iniciando" ] && [ "$espera" -lt "$BOOT_TIMEOUT" ]; do
+            sleep 3
+            espera=$(( espera + 3 ))
+            estado=$(controle ping)
+        done
+
+        case "$estado" in
+            "ok pronto")
+                resposta=$(controle reload)
+                case "$resposta" in
+                    ok*)
+                        log "[ChonOS EmbeddedMAS] $resposta"
+                        echo "{ \"message\" : \"Starting the Multi-Agent System, process $pid\","
+                        echo "  \"logmonitor\":\"http://$(hostname):3271\","
+                        echo "  \"mindmonitor\":\"http://$(hostname):3272\"}"
+                        exit 0
+                        ;;
+                    *)
+                        log "[ChonOS EmbeddedMAS] recarga falhou ($resposta); reiniciando"
+                        ;;
+                esac
+                ;;
+            *)
+                log "[ChonOS EmbeddedMAS] canal de controle indisponivel ($estado); reiniciando"
+                ;;
+        esac
+
+        # Fallback: comportamento tradicional.
+        /usr/bin/chonosEmbeddedMAS --stop -f "$file"
+        /usr/bin/chonosEmbeddedMAS --start -f "$file"
+        exit $?
+    fi
+
+    if [ -n "$memory" ]; then
+        echo "$memory" > "$EmbedMAS_TMP/memory2MAS"
+        HEAP_MB=$memory
+    else
+        memoryUSAGE
+    fi
+
+    build_classpath
+
+    directory=$(dirname "$file")
+    cd "$directory" || exit 1
+    mkdir -p log
+
+    # O Jason, sem configuração explicita de logging, usa o
+    # MASConsoleLogHandler, que instancia um JFrame do Swing. Num dispositivo
+    # sem servidor X isso lanca HeadlessException durante a inicializacao do
+    # LogManager e o log do MAS inteiro se perde - o processo continua vivo,
+    # mas sem nenhuma saida.
+    if [ ! -f "$LOGGING_CONF" ]; then
+        mkdir -p "$(dirname "$LOGGING_CONF")"
+        cat > "$LOGGING_CONF" <<'LOGEOF'
+handlers = java.util.logging.ConsoleHandler
+.level = INFO
+java.util.logging.ConsoleHandler.level = INFO
+java.util.logging.ConsoleHandler.formatter = java.util.logging.SimpleFormatter
+java.util.logging.SimpleFormatter.format = [%4$s] %5$s%6$s%n
+jason.level = INFO
+LOGEOF
+        log "[ChonOS EmbeddedMAS] logging.properties gerado em $LOGGING_CONF"
+    fi
+
+    log " "
+    log "[ChonOS EmbeddedMAS] Starting the Multi-Agent System..."
+
+    # -Xss512k e SerialGC medidos como adequados neste hardware.
+    # $! captura o PID de forma confiavel, sem depender de o processo ja
+    # aparecer no ps - que e onde o original falha em hardware lento.
+    "$JAVA_BIN" -Xmx"$HEAP_MB"m -Xss512k -XX:+UseSerialGC \
+        -Djava.awt.headless=true \
+        -cp "$CP" "$MAIN_CLASS" "$file" --log-conf "$LOGGING_CONF" \
+        >> "$EmbedMAS_TMP/embeddedMAS.log" 2>&1 &
+    pid=$!
+
+    echo "$pid" > "$EmbedMAS_TMP/embeddedMAS.pid"
+
+    subdomain=$(cat /opt/group.chon/conf/ddns.conf 2>/dev/null | cut -d ":" -f 1)
+    [ -z "$subdomain" ] && subdomain=$(hostname)
+
+    echo "{ \"message\" : \"Starting the Multi-Agent System, process $pid\","
+    echo "  \"logmonitor\":\"http://$subdomain:3271\","
+    echo "  \"mindmonitor\":\"http://$subdomain:3272\"}"
+
+# --------------------------------------------------------------------------
+# --stop
+# --------------------------------------------------------------------------
+elif [ "$opt" = "stop" ]; then
+    [ -z "$file" ] && file=$(ls "$MAS_HOME"/*.mas2j 2>/dev/null | head -1)
+
+    pid=$(cat "$EmbedMAS_TMP/embeddedMAS.pid" 2>/dev/null)
+
+    if [ -n "$pid" ]; then
+        [ -n "$file" ] && touch "$(dirname "$file")/.stop___MAS"
+        log "[ChonOS EmbeddedMAS] Stopping the Multi-agent System Gently..."
+
+        round=$GRACE
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            round=$(( round - 1 ))
+            if [ "$round" -le 0 ]; then
+                log "[ChonOS EmbeddedMAS] Killing the Multi-Agent System..."
+                kill -9 "$pid" 2>/dev/null
+                sleep 1
+                break
+            fi
+        done
+
+        log "[ChonOS EmbeddedMAS] Multi-Agent System Successfully Terminated!"
+        parar_motores
+        rm -f "$EmbedMAS_TMP/embeddedMAS.pid"
+        [ -n "$file" ] && rm -f "$(dirname "$file")/.stop___MAS"
+        echo "{ \"message\" : \"Stopping the Multi-Agent System, process $pid\"}"
+    else
+        parar_motores
+        echo "{ \"message\" : \"There is no Multi-Agent System in execution!\"}"
+    fi
+
+# --------------------------------------------------------------------------
+# --import
+# --------------------------------------------------------------------------
+elif [ "$opt" = "import" ]; then
+    if [ -n "$file" ] && [ -f "$file" ]; then
+        rm -rf "$EmbedMAS_TMP/embeddedmasIN"
+        mkdir -p "$EmbedMAS_TMP/embeddedmasIN"
+        unzip -o -q "$file" -d "$EmbedMAS_TMP/embeddedmasIN/"
+        mas2jFile=$(find "$EmbedMAS_TMP/embeddedmasIN/" -name '*.mas2j' | tail -1)
+        if [ -z "$mas2jFile" ]; then
+            echo "{ \"message\" : \"ERRO: nenhum .mas2j no pacote\"}"
+            exit 1
+        fi
+        directory=$(dirname "$mas2jFile")
+        mkdir -p "$MAS_HOME"
+        rm -rf "${MAS_HOME:?}"/*
+        mv "$directory"/* "$MAS_HOME"/
+        log "[ChonOS EmbeddedMAS] The Multi-Agent Was Imported!"
+        echo "{ \"message\" : \"The Multi-Agent System was imported\"}"
+    else
+        echo "{ \"message\" : \"ERRO: arquivo nao informado ou inexistente\"}"
+        exit 1
+    fi
+
+else
+    echo "chonosEmbeddedMAS (ev3dev)"
+    echo "Uso: --start | --stop | --import  [-f arquivo] [-m heapMB]"
+    exit 0
+fi
